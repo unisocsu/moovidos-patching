@@ -1,0 +1,81 @@
+name: Disassemble native lib around crash offset
+
+# Upload libnative-sec-lib_arm64.so to the repo root, then run this
+# workflow manually from the Actions tab.
+on:
+  workflow_dispatch:
+
+jobs:
+  disasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install disassembly tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils-multiarch binutils-aarch64-linux-gnu
+          pip install capstone
+
+      - name: Basic file info
+        run: |
+          file libnative-sec-lib_arm64.so
+          readelf -h libnative-sec-lib_arm64.so
+          echo "--- Dynamic symbols (exports) ---"
+          readelf -d libnative-sec-lib_arm64.so || true
+          nm -D libnative-sec-lib_arm64.so 2>&1 | head -100 || true
+
+      - name: objdump full disassembly (if supported)
+        run: |
+          objdump -d libnative-sec-lib_arm64.so > full_objdump.txt 2>&1 || echo "objdump failed, see file"
+          echo "--- context around crash offset 0x18fb6 ---"
+          grep -n "18f[0-9a-f][0-9a-f]:\|190[0-9a-f][0-9a-f]:" full_objdump.txt | head -5
+
+      - name: Capstone disassembly around 0x18fb6 (.text-relative)
+        run: |
+          python3 << 'EOF'
+          from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+          import struct
+
+          path = "libnative-sec-lib_arm64.so"
+          data = open(path, "rb").read()
+
+          # Parse ELF program headers to map file offset 0x18fb6 (which in the
+          # crash log is a PC value, likely close to a file-offset since this
+          # is a position-independent .so mapped near its file layout for the
+          # executable segment). We dump a window of raw bytes at that file
+          # offset and disassemble it; if this doesn't look like valid code,
+          # the offset may need adjusting for the load bias - print sections too.
+          target = 0x18fb6
+          window_before = 0x200
+          window_after = 0x200
+
+          start = max(0, target - window_before)
+          end = min(len(data), target + window_after)
+          chunk = data[start:end]
+
+          md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+          md.detail = False
+
+          with open("capstone_dump.txt", "w") as out:
+              out.write(f"File size: {len(data)} bytes\n")
+              out.write(f"Dumping bytes [{hex(start)} - {hex(end)}), target offset {hex(target)}\n\n")
+              for insn in md.disasm(chunk, start):
+                  marker = " <=== CRASH PC" if abs(insn.address - target) < 4 else ""
+                  out.write(f"0x{insn.address:x}:\t{insn.mnemonic}\t{insn.op_str}{marker}\n")
+          print(open("capstone_dump.txt").read())
+          EOF
+
+      - name: Section headers (to sanity check offset interpretation)
+        run: |
+          readelf -S libnative-sec-lib_arm64.so > sections.txt
+          cat sections.txt
+
+      - name: Upload analysis artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-lib-analysis
+          path: |
+            full_objdump.txt
+            capstone_dump.txt
+            sections.txt
